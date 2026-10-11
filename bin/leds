@@ -11,6 +11,8 @@ set -uo pipefail
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pc-leds"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state"
+DEV_CACHE="$CONFIG_DIR/devices"     # cached OpenRGB device list (one per boot)
+SIZED_FILE="$CONFIG_DIR/sized"      # ARGB_SIZE we last applied to the zones
 SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pc-leds"
 REPO_URL_TARBALL="https://codeload.github.com/Shahzad-Marth/pc-leds/tar.gz/refs/heads/main"
 mkdir -p "$CONFIG_DIR" 2>/dev/null || true
@@ -49,18 +51,33 @@ need_openrgb() {
   exit 1
 }
 
-wait_devices() {
+DEVLIST=""
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+
+# Load the device list, reusing a per-boot cache. OpenRGB spends ~1.5s detecting
+# hardware on every run, so caching lets on/off need a single invocation.
+load_devices() {
+  if [ -s "$DEV_CACHE" ] && [ "$(sed -n 1p "$DEV_CACHE" 2>/dev/null)" = "$BOOT_ID" ]; then
+    DEVLIST="$(tail -n +2 "$DEV_CACHE")"
+    return 0
+  fi
   local i
   for i in $(seq 1 "$WAIT_MAX"); do
-    list_devices | grep -qE '^[0-9]+: ' && return 0
+    DEVLIST="$(list_devices)"
+    if printf '%s' "$DEVLIST" | grep -qE '^[0-9]+: '; then
+      { printf '%s\n' "$BOOT_ID"; printf '%s\n' "$DEVLIST"; } > "$DEV_CACHE" 2>/dev/null || true
+      return 0
+    fi
     sleep 1
   done
   return 1
 }
 
+refresh_devices() { rm -f "$DEV_CACHE" 2>/dev/null || true; load_devices; }
+
 # Emit one line per device: idx \t name \t type \t modes \t zones
 parse_devices() {
-  list_devices | awk '
+  printf '%s\n' "$DEVLIST" | awk '
     /^[0-9]+: / {
       if (idx != "") print idx "\t" name "\t" type "\t" modes "\t" zones;
       idx=$1; sub(/:$/, "", idx); sub(/^[0-9]+:[ \t]*/, ""); name=$0; type=""; modes=""; zones=""; next
@@ -91,27 +108,37 @@ size_argb_zones() {
   done <<< "$devs"
 }
 
+# Size the ARGB zones only when needed (they persist in OpenRGB's sizes.ors),
+# so the common on/off path stays a single OpenRGB invocation.
+size_if_needed() {
+  [ "$(cat "$SIZED_FILE" 2>/dev/null)" = "$ARGB_SIZE" ] && return 0
+  load_devices || return 0
+  size_argb_zones
+  printf '%s\n' "$ARGB_SIZE" > "$SIZED_FILE" 2>/dev/null || true
+}
+
 leds_off() {
   need_openrgb
-  if ! wait_devices; then
+  if ! load_devices; then
     say "pc-leds: no OpenRGB devices detected"
     exit 3            # lets the systemd service retry before giving up
   fi
-  size_argb_zones
-  local devs idx name type modes zones
-  devs="$(parse_devices)"
-  # 1) paint every device black in Direct mode (works even if it was in an effect)
+  size_if_needed
+  # one OpenRGB invocation: native Off for devices that have it, else Direct black
+  local devs idx name type modes zones; devs="$(parse_devices)"
+  local -a args=()
   while IFS=$'\t' read -r idx name type modes zones; do
-    if printf '%s' "$modes" | grep -q 'Direct'; then
-      run -d "$idx" -m Direct -c 000000
-    else
-      run -d "$idx" -c 000000
-    fi
+    [ -n "$idx" ] || continue
+    case " $modes " in
+      *" Off "*|*"[Off]"*) args+=( -d "$idx" -m Off ) ;;
+      *) if printf '%s' "$modes" | grep -q 'Direct'; then
+           args+=( -d "$idx" -m Direct -c 000000 )
+         else
+           args+=( -d "$idx" -c 000000 )
+         fi ;;
+    esac
   done <<< "$devs"
-  # 2) use the controller's native "Off" mode where it exists (e.g. ENE DRAM)
-  while IFS=$'\t' read -r idx name type modes zones; do
-    case " $modes " in *" Off "*|*"[Off]"*) run -d "$idx" -m Off ;; esac
-  done <<< "$devs"
+  [ ${#args[@]} -gt 0 ] && run "${args[@]}"
   printf 'off\n' > "$STATE_FILE" 2>/dev/null || true
   notify "OFF"
   say "LEDs: OFF"
@@ -119,19 +146,21 @@ leds_off() {
 
 leds_on() {
   need_openrgb
-  wait_devices || say "pc-leds: no OpenRGB devices detected"
-  size_argb_zones
-  local devs idx name type modes zones
-  devs="$(parse_devices)"
-  # switch every device to Direct and set the colour (a bare -c won't leave an
-  # effect/Off mode, which is why the RAM used to stay dark).
+  load_devices || say "pc-leds: no OpenRGB devices detected"
+  size_if_needed
+  # one OpenRGB invocation: put all devices in Direct + colour (a bare -c
+  # won't leave an effect/Off mode, which is why the RAM used to stay dark).
+  local devs idx name type modes zones; devs="$(parse_devices)"
+  local -a args=()
   while IFS=$'\t' read -r idx name type modes zones; do
+    [ -n "$idx" ] || continue
     if printf '%s' "$modes" | grep -q 'Direct'; then
-      run -d "$idx" -m Direct -c "$ON_COLOR"
+      args+=( -d "$idx" -m Direct -c "$ON_COLOR" )
     else
-      run -d "$idx" -c "$ON_COLOR"
+      args+=( -d "$idx" -c "$ON_COLOR" )
     fi
   done <<< "$devs"
+  [ ${#args[@]} -gt 0 ] && run "${args[@]}"
   printf 'on\n' > "$STATE_FILE" 2>/dev/null || true
   notify "ON"
   say "LEDs: ON ($ON_COLOR)"
@@ -155,22 +184,24 @@ pick_mode() {    # modes candidate...  -> first candidate that the device offers
 
 leds_rainbow() {
   need_openrgb
-  if ! wait_devices; then
+  if ! load_devices; then
     say "pc-leds: no OpenRGB devices detected"
     exit 3
   fi
-  size_argb_zones
-  local devs idx name type modes zones mode
-  devs="$(parse_devices)"
-  # use each device's native animated rainbow/colour-cycle mode (hardware driven)
+  size_if_needed
+  # one OpenRGB invocation with each device's native animated rainbow effect
+  local devs idx name type modes zones mode; devs="$(parse_devices)"
+  local -a args=()
   while IFS=$'\t' read -r idx name type modes zones; do
+    [ -n "$idx" ] || continue
     mode="$(pick_mode "$modes" Rainbow 'Spectrum Cycle' 'Color Cycle' Spectrum 'Rainbow Wave' || true)"
     if [ -n "$mode" ]; then
-      run -d "$idx" -m "$mode"
+      args+=( -d "$idx" -m "$mode" )
     elif printf '%s' "$modes" | grep -q 'Direct'; then
-      run -d "$idx" -m Direct -c "$ON_COLOR"   # no rainbow mode: show ON colour
+      args+=( -d "$idx" -m Direct -c "$ON_COLOR" )   # no rainbow mode: ON colour
     fi
   done <<< "$devs"
+  [ ${#args[@]} -gt 0 ] && run "${args[@]}"
   printf 'on\n' > "$STATE_FILE" 2>/dev/null || true
   notify "Rainbow"
   say "LEDs: rainbow"
@@ -246,8 +277,12 @@ case "${1:-toggle}" in
   toggle) [ "$(cat "$STATE_FILE" 2>/dev/null)" = off ] && leds_on || leds_off ;;
   status|list)
     need_openrgb
-    list_devices
+    refresh_devices
+    printf '%s\n' "$DEVLIST"
     ;;
+  resize) need_openrgb; rm -f "$SIZED_FILE" 2>/dev/null || true; refresh_devices
+          size_argb_zones; printf '%s\n' "$ARGB_SIZE" > "$SIZED_FILE" 2>/dev/null || true
+          say "addressable zones set to $ARGB_SIZE LEDs" ;;
   setup)  shift || true; run_setup "$@" ;;
   gui)    shift || true; run_gui "$@" ;;
   -h|--help|help)
@@ -259,6 +294,7 @@ pc-leds - control PC RGB LEDs via OpenRGB
   leds rainbow   animate every device with its native rainbow/colour-cycle
   leds toggle    flip between on and off
   leds status    list the devices OpenRGB can see
+  leds resize    re-apply the addressable (ARGB) zone size from ARGB_SIZE
   leds setup     install OpenRGB + system configuration (distro-aware)
   leds gui       open the PC LEDs graphical app
 
@@ -266,5 +302,5 @@ Config file: $CONFIG_FILE
   ON_COLOR=RRGGBB   ARGB_SIZE=N   ARGB_ZONES="0 1 2"
 EOF
     ;;
-  *) echo "Usage: leds {on|off|toggle|rainbow|status|setup|gui}" >&2; exit 1 ;;
+  *) echo "Usage: leds {on|off|toggle|rainbow|status|resize|setup|gui}" >&2; exit 1 ;;
 esac

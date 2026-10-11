@@ -348,10 +348,29 @@ class Window(Adw.ApplicationWindow):
             except OSError:
                 pass
         # keep the switch where the user put it: don't rebuild the rows here
-        self.apply_async(lambda: [self.apply_device(d, state) for d in group["devices"]],
+        self.apply_async(lambda: self.apply_group(group["devices"], state),
                          "%s: %s" % (group["title"], "ON" if state else "OFF"),
                          refresh=False)
         return False
+
+    def apply_group(self, devices, on):
+        """Apply on/off to several devices in a single OpenRGB invocation."""
+        if not self.openrgb:
+            raise RuntimeError("OpenRGB not installed")
+        args = [self.openrgb, "--noautoconnect"]
+        for dev in devices:
+            args += ["-d", str(dev["index"])]
+            if on:
+                if any(m.strip("[]") == "Direct" for m in dev["modes"]):
+                    args += ["-m", "Direct"]
+                args += ["-c", self.on_color_hex]
+            elif any(m.strip("[]") == "Off" for m in dev["modes"]):
+                args += ["-m", "Off"]
+            else:
+                if any(m.strip("[]") == "Direct" for m in dev["modes"]):
+                    args += ["-m", "Direct"]
+                args += ["-c", "000000"]
+        subprocess.run(args, capture_output=True, text=True)
 
     # ------------------------------------------------------------ actions ----
     def do_all(self, on):
@@ -361,7 +380,8 @@ class Window(Adw.ApplicationWindow):
         self.leds_state = "on" if on else "off"
         for dev in self.devices:          # every device follows the All button
             self.dev_state[dev["index"]] = on
-        self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"))
+        self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"),
+                         refresh=False)
 
     def do_rainbow(self):
         self.stop_rainbow()

@@ -128,13 +128,17 @@ the last few LEDs stay lit, raise `ARGB_SIZE`.
 
 ## How it works
 
-- **`leds off`** — sizes any `ARGB`/addressable zones on the motherboard, paints
-  every detected device black, then switches devices that expose a native
-  `Off` mode (e.g. ENE DRAM) to it.
-- **`leds on`** — sizes the zones, then paints every device `ON_COLOR`.
-- **`leds rainbow`** — sizes the zones, then sets each device to its native
-  animated `Rainbow`-family effect when it has one; devices without a working
-  effect get the ON colour.
+- **`leds off`** — in a single OpenRGB call, sets devices that expose a native
+  `Off` mode (e.g. ENE DRAM) to it and paints the rest black.
+- **`leds on`** — in a single call, paints every device `Direct` + `ON_COLOR`.
+- **`leds rainbow`** — in a single call, sets each device to its native animated
+  `Rainbow`-family effect when it has one; devices without a working effect get
+  the ON colour.
+- **Speed** — OpenRGB spends ~1.5–2.5 s detecting hardware on every run, so the
+  device list is cached per boot and the ARGB zone size is applied once (and
+  remembered in OpenRGB's `sizes.ors`); a normal `leds on`/`off` is one
+  OpenRGB call. Use **`leds resize`** to re-apply the zone size after changing
+  `ARGB_SIZE` or adding strips.
 - Devices are selected by **name/type**, not index, because OpenRGB renumbers
   them between reboots.
 - System changes live in `scripts/setup-system.sh` (run as root), so both the

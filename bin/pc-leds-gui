@@ -1,0 +1,394 @@
+#!/usr/bin/python3
+# =============================================================================
+#  PC LEDs - a small GTK4/libadwaita front-end for pc-leds / OpenRGB
+# -----------------------------------------------------------------------------
+#  * ON / OFF for everything, with a colour picker
+#  * per-device switches (uses the controller's native Off mode when present)
+#  * "Install / Configure" installs OpenRGB + system setup for this distro,
+#    via PolicyKit (pkexec) - no terminal required.
+#
+#  Runs on the system Python (needs python3-gobject, gtk4, libadwaita).
+# =============================================================================
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, Gdk, Gio, GLib  # noqa: E402
+
+APP_ID = "io.github.shahzadmarth.PcLeds"
+VERSION = "1.0"
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "pc-leds")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+SUPPORT_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "pc-leds")
+
+DEFAULT_ON = "ffffff"
+DEFAULT_ARGB = "128"
+
+
+# --------------------------------------------------------------- helpers -----
+def hex_to_rgba(value):
+    h = value.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        h = DEFAULT_ON
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return Gdk.RGBA(red=r / 255.0, green=g / 255.0, blue=b / 255.0, alpha=1.0)
+
+
+def rgba_to_hex(rgba):
+    return "%02x%02x%02x" % (
+        max(0, min(255, round(rgba.red * 255))),
+        max(0, min(255, round(rgba.green * 255))),
+        max(0, min(255, round(rgba.blue * 255))),
+    )
+
+
+def find_openrgb():
+    cands = [
+        os.environ.get("PCLEDS_OPENRGB"),
+        shutil.which("openrgb"),
+        os.path.join(HOME, ".local", "bin", "openrgb"),
+        "/usr/local/bin/openrgb",
+        "/usr/bin/openrgb",
+        "/opt/openrgb/AppRun",
+    ]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def find_leds():
+    for c in [os.path.join(HOME, ".local", "bin", "leds"), os.path.join(SUPPORT_DIR, "bin", "leds")]:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def find_support(*rel):
+    here = os.path.dirname(os.path.realpath(__file__))
+    cands = [os.path.join(SUPPORT_DIR, *rel), os.path.normpath(os.path.join(here, "..", *rel))]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def read_config():
+    cfg = {"ON_COLOR": DEFAULT_ON, "ARGB_SIZE": DEFAULT_ARGB, "ARGB_ZONES": ""}
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return cfg
+
+
+def write_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+        fh.write("# pc-leds configuration\n")
+        fh.write('ON_COLOR="%s"\n' % cfg.get("ON_COLOR", DEFAULT_ON))
+        fh.write('ARGB_SIZE="%s"\n' % cfg.get("ARGB_SIZE", DEFAULT_ARGB))
+        fh.write('ARGB_ZONES="%s"\n' % cfg.get("ARGB_ZONES", ""))
+
+
+def list_devices(openrgb):
+    if not openrgb:
+        return []
+    try:
+        out = subprocess.run(
+            [openrgb, "--noautoconnect", "-l"],
+            capture_output=True, text=True, timeout=25,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    devs, cur = [], None
+    for line in out.splitlines():
+        m = re.match(r"^(\d+):\s*(.*)$", line)
+        if m:
+            cur = {"index": int(m.group(1)), "name": m.group(2).strip(),
+                   "type": "", "modes": [], "zones": []}
+            devs.append(cur)
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s.startswith("Type:"):
+            cur["type"] = s[5:].strip()
+        elif s.startswith("Modes:"):
+            try:
+                cur["modes"] = shlex.split(s[6:].strip())
+            except ValueError:
+                cur["modes"] = s[6:].split()
+        elif s.startswith("Zones:"):
+            cur["zones"] = s[6:].split()
+    return devs
+
+
+def run_async(fn, done=None):
+    def worker():
+        err = None
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            err = exc
+        if done is not None:
+            GLib.idle_add(done, err)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ----------------------------------------------------------------- window ----
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="PC LEDs")
+        self.set_default_size(540, 700)
+
+        self.openrgb = find_openrgb()
+        self.leds = find_leds()
+        self.cfg = read_config()
+        self.on_color_hex = self.cfg.get("ON_COLOR", DEFAULT_ON)
+        self.dev_rows = []
+        self.devices = []
+
+        self.toast = Adw.ToastOverlay()
+        toolbar = Adw.ToolbarView()
+
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="PC LEDs", subtitle="OpenRGB control"))
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh.set_tooltip_text("Re-detect devices")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        header.pack_start(refresh)
+
+        menu = Gio.Menu()
+        menu.append("Install / Configure\u2026", "win.setup")
+        menu.append("About PC LEDs", "win.about")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        toolbar.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+
+        # --- All devices -----------------------------------------------------
+        g_all = Adw.PreferencesGroup(title="All Devices")
+
+        color_row = Adw.ActionRow(title="On colour", subtitle="Colour used by ON / 'leds on'")
+        self.color_btn = Gtk.ColorDialogButton.new(Gtk.ColorDialog())
+        self.color_btn.set_rgba(hex_to_rgba(self.on_color_hex))
+        self.color_btn.set_valign(Gtk.Align.CENTER)
+        self.color_btn.set_tooltip_text("Pick the ON colour")
+        self.color_btn.connect("notify::rgba", self._on_color_changed)
+        color_row.add_suffix(self.color_btn)
+        g_all.add(color_row)
+
+        big_row = Adw.ActionRow(title="All LEDs", subtitle="Apply to every detected device")
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
+        on_btn = Gtk.Button(label="ON")
+        on_btn.add_css_class("suggested-action")
+        on_btn.connect("clicked", lambda *_: self.do_all(True))
+        off_btn = Gtk.Button(label="OFF")
+        off_btn.add_css_class("destructive-action")
+        off_btn.connect("clicked", lambda *_: self.do_all(False))
+        box.append(on_btn)
+        box.append(off_btn)
+        big_row.add_suffix(box)
+        g_all.add(big_row)
+
+        page.add(g_all)
+
+        # --- Devices ---------------------------------------------------------
+        self.dev_group = Adw.PreferencesGroup(title="Devices")
+        page.add(self.dev_group)
+
+        # --- Setup -----------------------------------------------------------
+        g_setup = Adw.PreferencesGroup(title="Setup")
+        self.status_row = Adw.ActionRow(title="OpenRGB")
+        setup_btn = Gtk.Button(label="Install / Configure")
+        setup_btn.add_css_class("pill")
+        setup_btn.set_valign(Gtk.Align.CENTER)
+        setup_btn.set_tooltip_text("Install OpenRGB and configure this system")
+        setup_btn.connect("clicked", lambda *_: self.do_setup())
+        self.status_row.add_suffix(setup_btn)
+        g_setup.add(self.status_row)
+        page.add(g_setup)
+
+        toolbar.set_content(page)
+        self.toast.set_child(toolbar)
+        self.set_content(self.toast)
+
+        act = Gio.SimpleAction.new("setup", None)
+        act.connect("activate", lambda *_: self.do_setup())
+        self.add_action(act)
+        act = Gio.SimpleAction.new("about", None)
+        act.connect("activate", lambda *_: self.show_about())
+        self.add_action(act)
+
+        self.refresh()
+
+    # ---------------------------------------------------------- callbacks ----
+    def _on_color_changed(self, btn, _pspec):
+        self.on_color_hex = rgba_to_hex(btn.get_rgba())
+
+    def _on_dev_switch(self, _sw, state, dev):
+        self.apply_async(lambda: self.apply_device(dev, state),
+                         "%s: %s" % (dev["name"], "ON" if state else "OFF"))
+        return False
+
+    # ------------------------------------------------------------ actions ----
+    def do_all(self, on):
+        self.cfg["ON_COLOR"] = self.on_color_hex
+        write_config(self.cfg)
+        self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"))
+
+    def apply_all(self, on):
+        if self.leds:
+            subprocess.run([self.leds, "on" if on else "off"], capture_output=True, text=True)
+            return
+        if not self.openrgb:
+            raise RuntimeError("OpenRGB not installed")
+        subprocess.run([self.openrgb, "--noautoconnect", "-c",
+                        self.on_color_hex if on else "000000"], capture_output=True, text=True)
+
+    def apply_device(self, dev, on):
+        if not self.openrgb:
+            raise RuntimeError("OpenRGB not installed")
+        args = [self.openrgb, "--noautoconnect", "-d", str(dev["index"])]
+        if on:
+            args += ["-c", self.on_color_hex]
+        elif any(m.strip("[]") == "Off" for m in dev["modes"]):
+            args += ["-m", "Off"]
+        else:
+            args += ["-c", "000000"]
+        subprocess.run(args, capture_output=True, text=True)
+
+    def apply_async(self, fn, ok_msg):
+        self.toast.add_toast(Adw.Toast(title="Working\u2026", timeout=1))
+
+        def done(err):
+            self.toast.add_toast(Adw.Toast(title=str(err) if err else ok_msg, timeout=3))
+            self.refresh()
+        run_async(fn, done)
+
+    def do_setup(self):
+        syssh = find_support("scripts", "setup-system.sh")
+        inst = find_support("install.sh")
+        if not syssh and not inst:
+            self.toast.add_toast(Adw.Toast(
+                title="Setup files not found \u2013 run ./install.sh from the repo", timeout=5))
+            return
+
+        def work():
+            if syssh:
+                if shutil.which("pkexec"):
+                    r = subprocess.run(["pkexec", "bash", syssh], capture_output=True, text=True)
+                elif shutil.which("sudo"):
+                    r = subprocess.run(["sudo", "bash", syssh], capture_output=True, text=True)
+                else:
+                    raise RuntimeError("need pkexec or sudo for system setup")
+                if r.returncode not in (0, 10):
+                    raise RuntimeError("system setup failed (see terminal)")
+            if inst:
+                subprocess.run(["bash", inst, "--skip-system"], capture_output=True, text=True)
+
+        self.toast.add_toast(Adw.Toast(title="Installing\u2026 enter your password", timeout=2))
+        self.apply_async(work, "Setup complete (reboot may be required)")
+
+    def show_about(self):
+        about = Adw.AboutWindow(transient_for=self, application_name="PC LEDs",
+                                application_icon="video-display", version=VERSION,
+                                comments="Control PC RGB LEDs (motherboard ARGB + RAM) via OpenRGB.",
+                                website="https://github.com/Shahzad-Marth/pc-leds")
+        about.set_developers(["Shahzad Marth"])
+        about.present()
+
+    # ------------------------------------------------------------ refresh ----
+    def refresh(self):
+        self.openrgb = find_openrgb()
+        for row in self.dev_rows:
+            self.dev_group.remove(row)
+        self.dev_rows = []
+        self.devices = list_devices(self.openrgb)
+
+        if not self.openrgb:
+            placeholder = Adw.ActionRow(title="OpenRGB not installed",
+                                        subtitle="Use \u201cInstall / Configure\u201d above")
+            self.dev_group.add(placeholder)
+            self.dev_rows.append(placeholder)
+        elif not self.devices:
+            placeholder = Adw.ActionRow(title="No devices detected",
+                                        subtitle="Check udev rules / permissions")
+            self.dev_group.add(placeholder)
+            self.dev_rows.append(placeholder)
+        else:
+            for dev in self.devices:
+                subtitle = dev["type"] or None
+                if dev["modes"]:
+                    subtitle = "%s \u00b7 %s" % (dev["type"] or "device", ", ".join(dev["modes"][:4]))
+                row = Adw.ActionRow(title=dev["name"], subtitle=subtitle)
+                sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+                sw.connect("state-set", self._on_dev_switch, dev)
+                row.add_suffix(sw)
+                row.set_activatable_widget(sw)
+                self.dev_group.add(row)
+                self.dev_rows.append(row)
+
+        base = self.openrgb or "not installed"
+        self.status_row.set_subtitle("%s%s" % (base,
+                                 "  \u00b7  %d device(s)" % len(self.devices) if self.devices else ""))
+
+
+class App(Adw.Application):
+    smoke = False
+
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.PREFER_DARK)
+
+    def do_activate(self):
+        if self.smoke:
+            Window(self)          # construct the whole UI, but never present it
+            print("smoke: UI constructed OK (%d devices)" % len(list_devices(find_openrgb())))
+            self.quit()
+            return
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+def self_test():
+    print("openrgb:", find_openrgb())
+    print("leds   :", find_leds())
+    print("setup  :", find_support("scripts", "setup-system.sh"))
+    for d in list_devices(find_openrgb()):
+        print("  [%d] %s (%s) modes=%s zones=%s" %
+              (d["index"], d["name"], d["type"], ",".join(d["modes"]), ",".join(d["zones"])))
+    return 0
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
+    if "--version" in sys.argv:
+        print("pc-leds-gui %s" % VERSION)
+        sys.exit(0)
+    if "--smoke" in sys.argv:
+        App.smoke = True
+        sys.argv = [a for a in sys.argv if a != "--smoke"]
+    sys.exit(App().run(sys.argv))

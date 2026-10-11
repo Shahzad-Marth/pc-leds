@@ -2,15 +2,17 @@
 # =============================================================================
 #  pc-leds - control PC RGB LEDs (motherboard ARGB + RAM) via OpenRGB
 # -----------------------------------------------------------------------------
-#  Usage:  leds {on|off|toggle|status|list}
+#  Usage:  leds {on|off|toggle|status|setup|gui}
 #
-#  Config:  ~/.config/pc-leds/config   (auto-created by install.sh)
+#  Config:  ~/.config/pc-leds/config   (created by install.sh)
 # =============================================================================
 set -uo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pc-leds"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_FILE="$CONFIG_DIR/state"
+SUPPORT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pc-leds"
+REPO_URL_TARBALL="https://codeload.github.com/Shahzad-Marth/pc-leds/tar.gz/refs/heads/main"
 mkdir -p "$CONFIG_DIR" 2>/dev/null || true
 
 # ---- defaults (overridden by the config file) -------------------------------
@@ -24,7 +26,6 @@ WAIT_MAX="15"         # seconds to wait for devices to appear
 
 QUIET="${LEDS_QUIET:-0}"
 OPENRGB="${PCLEDS_OPENRGB:-$(command -v openrgb || echo "$HOME/.local/bin/openrgb")}"
-[ -x "$OPENRGB" ] || { echo "pc-leds: OpenRGB not found (install it or set PCLEDS_OPENRGB)" >&2; exit 1; }
 
 run()    { "$OPENRGB" --noautoconnect "$@" >/dev/null 2>&1; }
 notify() { [ "$QUIET" = 1 ] && return 0
@@ -33,6 +34,12 @@ notify() { [ "$QUIET" = 1 ] && return 0
 say()    { [ "$QUIET" = 1 ] && return 0; echo "$@"; }
 
 list_devices() { "$OPENRGB" --noautoconnect -l 2>/dev/null; }
+
+need_openrgb() {
+  [ -x "$OPENRGB" ] && return 0
+  echo "pc-leds: OpenRGB not found - run 'leds setup' to install it" >&2
+  exit 1
+}
 
 wait_devices() {
   local i
@@ -57,67 +64,140 @@ parse_devices() {
   '
 }
 
-leds_off() {
-  wait_devices || say "pc-leds: no OpenRGB devices detected"
-  local devs; devs="$(parse_devices)"
-
-  # 1) Size addressable (ARGB) zones on the motherboard so a colour reaches them.
-  local idx name type modes zones
+# Size addressable (ARGB) zones on the motherboard so a colour reaches them.
+size_argb_zones() {
+  local devs idx name type modes zones zi zname z
+  devs="$(parse_devices)"
   while IFS=$'\t' read -r idx name type modes zones; do
     [ "$type" = "Motherboard" ] || continue
-    local zi=0 zname
+    zi=0
     for zname in $zones; do
       if printf '%s' "$zname" | grep -qiE 'argb|addr'; then
         run -d "$idx" -z "$zi" -sz "$ARGB_SIZE" -m Direct -c 000000
       fi
       zi=$((zi + 1))
     done
-    local z
     for z in ${ARGB_ZONES//,/ }; do
       [ -n "$z" ] && run -d "$idx" -z "$z" -sz "$ARGB_SIZE" -m Direct -c 000000
     done
   done <<< "$devs"
+}
 
-  # 2) Black out every device (also switches anything in an effect to Direct).
-  run -c 000000
-
-  # 3) Use the controller's native "Off" mode where it exists (e.g. ENE DRAM).
+leds_off() {
+  need_openrgb
+  if ! wait_devices; then
+    say "pc-leds: no OpenRGB devices detected"
+    exit 3            # lets the systemd service retry before giving up
+  fi
+  size_argb_zones
+  run -c 000000                                  # 1) black everything
+  local devs idx name type modes zones           # 2) native "Off" where available
+  devs="$(parse_devices)"
   while IFS=$'\t' read -r idx name type modes zones; do
-    case " $modes " in
-      *" Off "*) run -d "$idx" -m Off ;;
-    esac
+    case " $modes " in *" Off "*|*"[Off]"*) run -d "$idx" -m Off ;; esac
   done <<< "$devs"
-
   printf 'off\n' > "$STATE_FILE" 2>/dev/null || true
   notify "OFF"
   say "LEDs: OFF"
 }
 
 leds_on() {
+  need_openrgb
   wait_devices || say "pc-leds: no OpenRGB devices detected"
+  size_argb_zones
   run -c "$ON_COLOR"
   printf 'on\n' > "$STATE_FILE" 2>/dev/null || true
   notify "ON"
   say "LEDs: ON ($ON_COLOR)"
 }
 
+# ---------------------------------------------------------------- setup ------
+find_installer() {
+  local c
+  for c in "${PCLEDS_INSTALLER:-}" \
+           "$SUPPORT_DIR/install.sh" \
+           "$(dirname "$(readlink -f "$0")")/../install.sh" \
+           "$HOME/pc-leds/install.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+fetch_repo() {   # download the repo tarball; echo the extracted install.sh path
+  local tmp; tmp="$(mktemp -d)" || return 1
+  if curl -fsSL "$REPO_URL_TARBALL" | tar -xz -C "$tmp" --strip-components=1 2>/dev/null && [ -f "$tmp/install.sh" ]; then
+    printf '%s' "$tmp/install.sh"
+  else
+    rm -rf "$tmp"; return 1
+  fi
+}
+
+launch_terminal() {   # $1 = shell command string
+  local cmd="$1" t
+  for t in ptyxis gnome-terminal kgx konsole alacritty kitty foot wezterm xterm xfce4-terminal mate-terminal tilix; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    case "$t" in
+      ptyxis|gnome-terminal|kgx) exec "$t" -- bash -c "$cmd; exec bash" ;;
+      konsole|alacritty|xterm|xfce4-terminal|mate-terminal|tilix) exec "$t" -e bash -c "$cmd; exec bash" ;;
+      kitty|foot) exec "$t" bash -c "$cmd; exec bash" ;;
+      wezterm) exec "$t" start -- bash -c "$cmd; exec bash" ;;
+    esac
+  done
+  return 1
+}
+
+run_setup() {
+  local installer; installer="$(find_installer || true)"
+  if [ -z "$installer" ]; then
+    say "pc-leds: fetching installer..."
+    installer="$(fetch_repo || true)"
+  fi
+  [ -n "$installer" ] || { echo "pc-leds: cannot find or download the installer" >&2; exit 1; }
+  if [ -t 0 ] && [ -t 1 ]; then
+    exec bash "$installer" "$@"
+  fi
+  if launch_terminal "bash $(printf '%q' "$installer") $*"; then
+    exit 0
+  fi
+  echo "pc-leds: no terminal found. Run manually:" >&2
+  echo "  sudo bash $installer" >&2
+  exit 1
+}
+
+# ----------------------------------------------------------------- gui -------
+run_gui() {
+  local g
+  for g in "$HOME/.local/bin/pc-leds-gui" "$SUPPORT_DIR/bin/pc-leds-gui"; do
+    [ -x "$g" ] && { exec "$g" "$@"; }
+  done
+  echo "pc-leds: GUI not installed - run 'leds setup'" >&2
+  exit 1
+}
+
 case "${1:-toggle}" in
   off)    leds_off ;;
   on)     leds_on ;;
   toggle) [ "$(cat "$STATE_FILE" 2>/dev/null)" = off ] && leds_on || leds_off ;;
-  status|list) list_devices ;;
+  status|list)
+    need_openrgb
+    list_devices
+    ;;
+  setup)  shift || true; run_setup "$@" ;;
+  gui)    shift || true; run_gui "$@" ;;
   -h|--help|help)
     cat <<EOF
 pc-leds - control PC RGB LEDs via OpenRGB
 
-  leds on        set every detected device to $ON_COLOR ($CONFIG_FILE)
+  leds on        set every detected device to $ON_COLOR
   leds off       turn everything off (black / native Off mode)
   leds toggle    flip between on and off
   leds status    list the devices OpenRGB can see
+  leds setup     install OpenRGB + system configuration (distro-aware)
+  leds gui       open the PC LEDs graphical app
 
 Config file: $CONFIG_FILE
   ON_COLOR=RRGGBB   ARGB_SIZE=N   ARGB_ZONES="0 1 2"
 EOF
     ;;
-  *) echo "Usage: leds {on|off|toggle|status}" >&2; exit 1 ;;
+  *) echo "Usage: leds {on|off|toggle|status|setup|gui}" >&2; exit 1 ;;
 esac

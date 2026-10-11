@@ -149,6 +149,34 @@ def active_mode(modes):
     return None
 
 
+def friendly_type(kind):
+    return {"DRAM": "RAM"}.get(kind, kind)
+
+
+def group_devices(devices):
+    """Collapse devices that share a type into one row (e.g. all RAM sticks)."""
+    by_type, order = {}, []
+    for d in devices:
+        key = d["type"] or d["name"]
+        if key not in by_type:
+            by_type[key] = []
+            order.append(key)
+        by_type[key].append(d)
+    groups = []
+    for key in order:
+        devs = by_type[key]
+        if len(devs) == 1:
+            d = devs[0]
+            sub = d["type"] or None
+            if d["modes"]:
+                sub = "%s \u00b7 %s" % (d["type"] or "device", ", ".join(d["modes"][:4]))
+            groups.append({"title": d["name"], "subtitle": sub, "devices": devs})
+        else:
+            sub = "%d units \u00b7 %s" % (len(devs), ", ".join(devs[0]["modes"][:4]) or friendly_type(key))
+            groups.append({"title": friendly_type(key), "subtitle": sub, "devices": devs})
+    return groups
+
+
 def run_async(fn, done=None):
     def worker():
         err = None
@@ -255,11 +283,12 @@ class Window(Adw.ApplicationWindow):
     def _on_color_changed(self, btn, _pspec):
         self.on_color_hex = rgba_to_hex(btn.get_rgba())
 
-    def _on_dev_switch(self, _sw, state, dev):
-        self.dev_state[dev["index"]] = state
+    def _on_group_switch(self, _sw, state, group):
+        for dev in group["devices"]:
+            self.dev_state[dev["index"]] = state
         # keep the switch where the user put it: don't rebuild the rows here
-        self.apply_async(lambda: self.apply_device(dev, state),
-                         "%s: %s" % (dev["name"], "ON" if state else "OFF"),
+        self.apply_async(lambda: [self.apply_device(d, state) for d in group["devices"]],
+                         "%s: %s" % (group["title"], "ON" if state else "OFF"),
                          refresh=False)
         return False
 
@@ -357,17 +386,14 @@ class Window(Adw.ApplicationWindow):
             self.dev_group.add(placeholder)
             self.dev_rows.append(placeholder)
         else:
-            for dev in self.devices:
-                subtitle = dev["type"] or None
-                if dev["modes"]:
-                    subtitle = "%s \u00b7 %s" % (dev["type"] or "device", ", ".join(dev["modes"][:4]))
-                row = Adw.ActionRow(title=dev["name"], subtitle=subtitle)
+            for group in group_devices(self.devices):
+                row = Adw.ActionRow(title=group["title"], subtitle=group["subtitle"])
                 sw = Gtk.Switch(valign=Gtk.Align.CENTER)
-                idx = dev["index"]
-                if idx not in self.dev_state:
-                    self.dev_state[idx] = active_mode(dev["modes"]) != "Off"
-                sw.set_active(self.dev_state[idx])
-                sw.connect("state-set", self._on_dev_switch, dev)
+                for dev in group["devices"]:
+                    if dev["index"] not in self.dev_state:
+                        self.dev_state[dev["index"]] = active_mode(dev["modes"]) != "Off"
+                sw.set_active(all(self.dev_state[dev["index"]] for dev in group["devices"]))
+                sw.connect("state-set", self._on_group_switch, group)
                 row.add_suffix(sw)
                 row.set_activatable_widget(sw)
                 self.dev_group.add(row)

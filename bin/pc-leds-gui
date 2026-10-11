@@ -28,6 +28,7 @@ VERSION = "1.0"
 HOME = os.path.expanduser("~")
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "pc-leds")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+STATE_FILE = os.path.join(CONFIG_DIR, "state")   # written by the 'leds' CLI (on/off)
 SUPPORT_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "pc-leds")
 
 DEFAULT_ON = "ffffff"
@@ -98,6 +99,16 @@ def read_config():
     except OSError:
         pass
     return cfg
+
+
+def read_leds_state():
+    """Return 'on'/'off' as last written by the leds CLI, else None."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            val = fh.read().strip()
+    except OSError:
+        return None
+    return val if val in ("on", "off") else None
 
 
 def write_config(cfg):
@@ -199,6 +210,7 @@ class Window(Adw.ApplicationWindow):
         self.leds = find_leds()
         self.cfg = read_config()
         self.on_color_hex = self.cfg.get("ON_COLOR", DEFAULT_ON)
+        self.leds_state = read_leds_state()
         self.dev_rows = []
         self.devices = []
         # index -> last state we set (a bare Direct-black device still reads
@@ -286,6 +298,14 @@ class Window(Adw.ApplicationWindow):
     def _on_group_switch(self, _sw, state, group):
         for dev in group["devices"]:
             self.dev_state[dev["index"]] = state
+        # if that leaves every device the same, keep the CLI state file in sync
+        if self.devices and all(self.dev_state.get(d["index"]) == state for d in self.devices):
+            self.leds_state = "on" if state else "off"
+            try:
+                with open(STATE_FILE, "w", encoding="utf-8") as fh:
+                    fh.write(self.leds_state + "\n")
+            except OSError:
+                pass
         # keep the switch where the user put it: don't rebuild the rows here
         self.apply_async(lambda: [self.apply_device(d, state) for d in group["devices"]],
                          "%s: %s" % (group["title"], "ON" if state else "OFF"),
@@ -296,6 +316,7 @@ class Window(Adw.ApplicationWindow):
     def do_all(self, on):
         self.cfg["ON_COLOR"] = self.on_color_hex
         write_config(self.cfg)
+        self.leds_state = "on" if on else "off"
         for dev in self.devices:          # every device follows the All button
             self.dev_state[dev["index"]] = on
         self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"))
@@ -391,7 +412,10 @@ class Window(Adw.ApplicationWindow):
                 sw = Gtk.Switch(valign=Gtk.Align.CENTER)
                 for dev in group["devices"]:
                     if dev["index"] not in self.dev_state:
-                        self.dev_state[dev["index"]] = active_mode(dev["modes"]) != "Off"
+                        if self.leds_state is not None:
+                            self.dev_state[dev["index"]] = (self.leds_state == "on")
+                        else:
+                            self.dev_state[dev["index"]] = active_mode(dev["modes"]) != "Off"
                 sw.set_active(all(self.dev_state[dev["index"]] for dev in group["devices"]))
                 sw.connect("state-set", self._on_group_switch, group)
                 row.add_suffix(sw)

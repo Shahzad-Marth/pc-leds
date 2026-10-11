@@ -17,8 +17,17 @@ back.
 
 ---
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/pc-leds.png" alt="PC LEDs GUI" width="380">
+</p>
+
+---
+
 ## Table of Contents
 
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Why this exists](#why-this-exists)
 - [Requirements](#requirements)

@@ -273,23 +273,44 @@ install_launchers() {
   local dd; dd="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
   [ -n "$dd" ] && [ -d "$dd" ] || dd="$HOME/Desktop"
   mkdir -p "$dd" "$APP_DIR"
-  local name action src
-  for pair in "LEDs-OFF:off" "LEDs-ON:on"; do
-    name="${pair%%:*}"; action="${pair##*:}"
-    src="$SELF_DIR/data/${name}.desktop.in"
-    sed -e "s|@LEDS@|$BIN_DST|g" -e "s|@ICON@|$ICON|g" "$src" > "$dd/${name}.desktop"
-    chmod +x "$dd/${name}.desktop"
-    cp -f "$dd/${name}.desktop" "$APP_DIR/${name}.desktop"
-    command -v gio >/dev/null 2>&1 && gio set "$dd/${name}.desktop" metadata::trusted true 2>/dev/null || true
-  done
+  write_launcher "$dd/LEDs-OFF.desktop" "LEDs OFF" "Turn off all PC RGB LEDs" "off"
+  write_launcher "$dd/LEDs-ON.desktop"  "LEDs ON"  "Turn the PC RGB LEDs back on" "on"
+  chmod +x "$dd"/LEDs-OFF.desktop "$dd"/LEDs-ON.desktop
+  cp -f "$dd/LEDs-OFF.desktop" "$dd/LEDs-ON.desktop" "$APP_DIR/"
+  if command -v gio >/dev/null 2>&1; then
+    gio set "$dd/LEDs-OFF.desktop" metadata::trusted true 2>/dev/null || true
+    gio set "$dd/LEDs-ON.desktop"  metadata::trusted true 2>/dev/null || true
+  fi
   ok "launchers in $dd"
+}
+
+write_launcher() {   # path name comment action
+  cat > "$1" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$2
+Comment=$3
+Exec=$BIN_DST $4
+Terminal=false
+Icon=$ICON
+Categories=Utility;Settings;
+EOF
 }
 
 install_autostart() {
   [ "$DO_AUTOSTART" = 1 ] || return 0
   step "Login autostart (LEDs off by default)"
   mkdir -p "$AUTOSTART_DIR"
-  sed -e "s|@LEDS@|$BIN_DST|g" "$SELF_DIR/data/leds-autostart.desktop.in" > "$AUTOSTART_DIR/leds-off.desktop"
+  cat > "$AUTOSTART_DIR/leds-off.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=PC LEDs Off (autostart)
+Comment=Turn off all PC RGB LEDs at login
+Exec=env LEDS_QUIET=1 $BIN_DST off
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
   ok "$AUTOSTART_DIR/leds-off.desktop"
 }
 

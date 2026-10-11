@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=LEDs ON
-Comment=Turn the PC RGB LEDs back on
-Exec=@LEDS@ on
-Terminal=false
-Icon=@ICON@
-Categories=Utility;Settings;

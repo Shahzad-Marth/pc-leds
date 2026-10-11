@@ -173,6 +173,9 @@ class Window(Adw.ApplicationWindow):
         self.on_color_hex = self.cfg.get("ON_COLOR", DEFAULT_ON)
         self.dev_rows = []
         self.devices = []
+        # index -> last state we set (a bare Direct-black device still reads
+        # "Direct" from OpenRGB, so we can't infer on/off from the mode alone)
+        self.dev_state = {}
 
         self.toast = Adw.ToastOverlay()
         toolbar = Adw.ToolbarView()
@@ -253,6 +256,7 @@ class Window(Adw.ApplicationWindow):
         self.on_color_hex = rgba_to_hex(btn.get_rgba())
 
     def _on_dev_switch(self, _sw, state, dev):
+        self.dev_state[dev["index"]] = state
         # keep the switch where the user put it: don't rebuild the rows here
         self.apply_async(lambda: self.apply_device(dev, state),
                          "%s: %s" % (dev["name"], "ON" if state else "OFF"),
@@ -263,6 +267,8 @@ class Window(Adw.ApplicationWindow):
     def do_all(self, on):
         self.cfg["ON_COLOR"] = self.on_color_hex
         write_config(self.cfg)
+        for dev in self.devices:          # every device follows the All button
+            self.dev_state[dev["index"]] = on
         self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"))
 
     def apply_all(self, on):
@@ -357,7 +363,10 @@ class Window(Adw.ApplicationWindow):
                     subtitle = "%s \u00b7 %s" % (dev["type"] or "device", ", ".join(dev["modes"][:4]))
                 row = Adw.ActionRow(title=dev["name"], subtitle=subtitle)
                 sw = Gtk.Switch(valign=Gtk.Align.CENTER)
-                sw.set_active(active_mode(dev["modes"]) != "Off")
+                idx = dev["index"]
+                if idx not in self.dev_state:
+                    self.dev_state[idx] = active_mode(dev["modes"]) != "Off"
+                sw.set_active(self.dev_state[idx])
                 sw.connect("state-set", self._on_dev_switch, dev)
                 row.add_suffix(sw)
                 row.set_activatable_widget(sw)

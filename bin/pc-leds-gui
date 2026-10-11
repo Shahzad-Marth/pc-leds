@@ -233,6 +233,7 @@ class Window(Adw.ApplicationWindow):
         # "Direct" from OpenRGB, so we can't infer on/off from the mode alone)
         self.dev_state = {}
         self._rainbow_stop = None
+        self._color_timer = 0
         self.connect("close-request", lambda *_: (self.stop_rainbow(), False)[1])
 
         self.toast = Adw.ToastOverlay()
@@ -316,6 +317,23 @@ class Window(Adw.ApplicationWindow):
     # ---------------------------------------------------------- callbacks ----
     def _on_color_changed(self, btn, _pspec):
         self.on_color_hex = rgba_to_hex(btn.get_rgba())
+        self.cfg["ON_COLOR"] = self.on_color_hex
+        write_config(self.cfg)
+        # apply live when the LEDs are already on (debounced so dragging in the
+        # colour dialog doesn't fire an OpenRGB call for every step)
+        if self.leds_state == "on":
+            self.stop_rainbow()
+            if self._color_timer:
+                GLib.source_remove(self._color_timer)
+            self._color_timer = GLib.timeout_add(180, self._apply_color_now)
+
+    def _apply_color_now(self):
+        self._color_timer = 0
+        for dev in self.devices:
+            self.dev_state[dev["index"]] = True
+        self.apply_async(lambda: self.apply_all(True),
+                         "Colour: #%s" % self.on_color_hex, refresh=False)
+        return False
 
     def _on_group_switch(self, _sw, state, group):
         self.stop_rainbow()

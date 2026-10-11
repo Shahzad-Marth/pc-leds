@@ -86,6 +86,10 @@ works (your RAM: `Rainbow`). Hardware without a usable effect — the Gigabyte
 motherboard reports `Color Cycle` but silently ignores it — is animated by the
 app instead (a software hue-cycle) while the window is open.
 
+Picking a colour applies it **live** while the LEDs are on (and stops any
+running rainbow), so you see the change immediately; it also becomes the colour
+used by the next **ON** / `leds on`.
+
 The **Install / Configure** button runs the same distro-aware setup — it
 installs OpenRGB (native RPM/DEB, else the official AppImage), writes the udev
 rules, loads `i2c-dev`, and adds the kernel parameter — using PolicyKit

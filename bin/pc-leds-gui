@@ -228,6 +228,7 @@ class Window(Adw.ApplicationWindow):
         self.on_color_hex = self.cfg.get("ON_COLOR", DEFAULT_ON)
         self.leds_state = read_leds_state()
         self.dev_rows = []
+        self.switch_rows = []          # (switch, handler-id, group) for live sync
         self.devices = []
         # index -> last state we set (a bare Direct-black device still reads
         # "Direct" from OpenRGB, so we can't infer on/off from the mode alone)
@@ -331,6 +332,7 @@ class Window(Adw.ApplicationWindow):
         self._color_timer = 0
         for dev in self.devices:
             self.dev_state[dev["index"]] = True
+        self.sync_switches()
         self.apply_async(lambda: self.apply_all(True),
                          "Colour: #%s" % self.on_color_hex, refresh=False)
         return False
@@ -380,6 +382,7 @@ class Window(Adw.ApplicationWindow):
         self.leds_state = "on" if on else "off"
         for dev in self.devices:          # every device follows the All button
             self.dev_state[dev["index"]] = on
+        self.sync_switches()
         self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"),
                          refresh=False)
 
@@ -388,6 +391,7 @@ class Window(Adw.ApplicationWindow):
         self.leds_state = "on"
         for dev in self.devices:
             self.dev_state[dev["index"]] = True
+        self.sync_switches()
         self.apply_async(lambda: self.apply_rainbow(), "All LEDs: Rainbow")
 
     def apply_all(self, on):
@@ -440,6 +444,13 @@ class Window(Adw.ApplicationWindow):
         if ev is not None:
             ev.set()
             self._rainbow_stop = None
+
+    def sync_switches(self):
+        """Repaint the device switches from dev_state (no hardware call)."""
+        for sw, hid, group in self.switch_rows:
+            sw.handler_block(hid)
+            sw.set_active(all(self.dev_state.get(d["index"]) for d in group["devices"]))
+            sw.handler_unblock(hid)
 
     def apply_device(self, dev, on):
         if not self.openrgb:
@@ -504,6 +515,7 @@ class Window(Adw.ApplicationWindow):
         for row in self.dev_rows:
             self.dev_group.remove(row)
         self.dev_rows = []
+        self.switch_rows = []
         self.devices = list_devices(self.openrgb)
 
         if not self.openrgb:
@@ -527,11 +539,12 @@ class Window(Adw.ApplicationWindow):
                         else:
                             self.dev_state[dev["index"]] = active_mode(dev["modes"]) != "Off"
                 sw.set_active(all(self.dev_state[dev["index"]] for dev in group["devices"]))
-                sw.connect("state-set", self._on_group_switch, group)
+                hid = sw.connect("state-set", self._on_group_switch, group)
                 row.add_suffix(sw)
                 row.set_activatable_widget(sw)
                 self.dev_group.add(row)
                 self.dev_rows.append(row)
+                self.switch_rows.append((sw, hid, group))
 
         base = self.openrgb or "not installed"
         self.status_row.set_subtitle("%s%s" % (base,

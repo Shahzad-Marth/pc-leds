@@ -142,6 +142,13 @@ def list_devices(openrgb):
     return devs
 
 
+def active_mode(modes):
+    for m in modes:
+        if len(m) >= 2 and m.startswith("[") and m.endswith("]"):
+            return m[1:-1]
+    return None
+
+
 def run_async(fn, done=None):
     def worker():
         err = None
@@ -246,8 +253,10 @@ class Window(Adw.ApplicationWindow):
         self.on_color_hex = rgba_to_hex(btn.get_rgba())
 
     def _on_dev_switch(self, _sw, state, dev):
+        # keep the switch where the user put it: don't rebuild the rows here
         self.apply_async(lambda: self.apply_device(dev, state),
-                         "%s: %s" % (dev["name"], "ON" if state else "OFF"))
+                         "%s: %s" % (dev["name"], "ON" if state else "OFF"),
+                         refresh=False)
         return False
 
     # ------------------------------------------------------------ actions ----
@@ -282,12 +291,13 @@ class Window(Adw.ApplicationWindow):
             args += ["-c", "000000"]
         subprocess.run(args, capture_output=True, text=True)
 
-    def apply_async(self, fn, ok_msg):
+    def apply_async(self, fn, ok_msg, refresh=True):
         self.toast.add_toast(Adw.Toast(title="Working\u2026", timeout=1))
 
         def done(err):
             self.toast.add_toast(Adw.Toast(title=str(err) if err else ok_msg, timeout=3))
-            self.refresh()
+            if refresh:
+                self.refresh()
         run_async(fn, done)
 
     def do_setup(self):
@@ -347,6 +357,7 @@ class Window(Adw.ApplicationWindow):
                     subtitle = "%s \u00b7 %s" % (dev["type"] or "device", ", ".join(dev["modes"][:4]))
                 row = Adw.ActionRow(title=dev["name"], subtitle=subtitle)
                 sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+                sw.set_active(active_mode(dev["modes"]) != "Off")
                 sw.connect("state-set", self._on_dev_switch, dev)
                 row.add_suffix(sw)
                 row.set_activatable_widget(sw)

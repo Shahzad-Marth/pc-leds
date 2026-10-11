@@ -21,8 +21,16 @@ ARGB_SIZE="128"       # LEDs per addressable header (raise for long strips)
 ARGB_ZONES=""         # optional explicit zone indexes (e.g. "0 1 2"); empty = auto
 WAIT_MAX="15"         # seconds to wait for devices to appear
 
-# shellcheck source=/dev/null
-[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+# ---- config (parsed safely: values may carry inline '#' comments) -----------
+readcfg() {   # key default
+  [ -r "$CONFIG_FILE" ] || { printf '%s' "$2"; return; }
+  local v; v="$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONFIG_FILE" | tail -n1)"
+  v="${v%%#*}"; v="${v//\"/}"; v="$(printf '%s' "$v" | sed 's/[[:space:]]*$//')"
+  [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$2"
+}
+ON_COLOR="$(readcfg ON_COLOR "$ON_COLOR")"
+ARGB_SIZE="$(readcfg ARGB_SIZE "$ARGB_SIZE")"
+ARGB_ZONES="$(readcfg ARGB_ZONES "$ARGB_ZONES")"
 
 QUIET="${LEDS_QUIET:-0}"
 OPENRGB="${PCLEDS_OPENRGB:-$(command -v openrgb || echo "$HOME/.local/bin/openrgb")}"
@@ -55,7 +63,7 @@ parse_devices() {
   list_devices | awk '
     /^[0-9]+: / {
       if (idx != "") print idx "\t" name "\t" type "\t" modes "\t" zones;
-      idx=$1; sub(/^[0-9]+:[ \t]*/, ""); name=$0; type=""; modes=""; zones=""; next
+      idx=$1; sub(/:$/, "", idx); sub(/^[0-9]+:[ \t]*/, ""); name=$0; type=""; modes=""; zones=""; next
     }
     /^[[:space:]]*Type:/  { sub(/^[[:space:]]*Type:[[:space:]]*/,  ""); type=$0;  next }
     /^[[:space:]]*Modes:/ { sub(/^[[:space:]]*Modes:[[:space:]]*/, ""); modes=$0; next }
@@ -90,9 +98,17 @@ leds_off() {
     exit 3            # lets the systemd service retry before giving up
   fi
   size_argb_zones
-  run -c 000000                                  # 1) black everything
-  local devs idx name type modes zones           # 2) native "Off" where available
+  local devs idx name type modes zones
   devs="$(parse_devices)"
+  # 1) paint every device black in Direct mode (works even if it was in an effect)
+  while IFS=$'\t' read -r idx name type modes zones; do
+    if printf '%s' "$modes" | grep -q 'Direct'; then
+      run -d "$idx" -m Direct -c 000000
+    else
+      run -d "$idx" -c 000000
+    fi
+  done <<< "$devs"
+  # 2) use the controller's native "Off" mode where it exists (e.g. ENE DRAM)
   while IFS=$'\t' read -r idx name type modes zones; do
     case " $modes " in *" Off "*|*"[Off]"*) run -d "$idx" -m Off ;; esac
   done <<< "$devs"
@@ -105,7 +121,17 @@ leds_on() {
   need_openrgb
   wait_devices || say "pc-leds: no OpenRGB devices detected"
   size_argb_zones
-  run -c "$ON_COLOR"
+  local devs idx name type modes zones
+  devs="$(parse_devices)"
+  # switch every device to Direct and set the colour (a bare -c won't leave an
+  # effect/Off mode, which is why the RAM used to stay dark).
+  while IFS=$'\t' read -r idx name type modes zones; do
+    if printf '%s' "$modes" | grep -q 'Direct'; then
+      run -d "$idx" -m Direct -c "$ON_COLOR"
+    else
+      run -d "$idx" -c "$ON_COLOR"
+    fi
+  done <<< "$devs"
   printf 'on\n' > "$STATE_FILE" 2>/dev/null || true
   notify "ON"
   say "LEDs: ON ($ON_COLOR)"

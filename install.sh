@@ -27,6 +27,8 @@ ICON="video-display"
 
 ON_COLOR="ffffff"
 ARGB_SIZE="128"
+ON_COLOR_SET=0
+ARGB_SIZE_SET=0
 AUTOSTART_METHOD="xdg"        # xdg | systemd | none
 DO_UDEV=1
 DO_KPARAM=1
@@ -65,8 +67,8 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --on-color)         ON_COLOR="${2:-}"; shift 2 ;;
-    --argb-size)        ARGB_SIZE="${2:-}"; shift 2 ;;
+    --on-color)         ON_COLOR="${2:-}"; ON_COLOR_SET=1; shift 2 ;;
+    --argb-size)        ARGB_SIZE="${2:-}"; ARGB_SIZE_SET=1; shift 2 ;;
     --autostart-method) AUTOSTART_METHOD="${2:-xdg}"; shift 2 ;;
     --no-udev)          DO_UDEV=0; shift ;;
     --no-kernel-param)  DO_KPARAM=0; shift ;;
@@ -177,19 +179,36 @@ EOF
 }
 
 # ----------------------------------------------------------------- config ----
+set_kv() {   # key value  (set or add a key in the config file)
+  if grep -q "^$1=" "$CONFIG_FILE"; then sed -i "s|^$1=.*|$1=\"$2\"|" "$CONFIG_FILE"
+  else echo "$1=\"$2\"" >> "$CONFIG_FILE"; fi
+}
+
 write_config() {
   step "Configuration"
   mkdir -p "$CONFIG_DIR"
-  if [ -f "$CONFIG_FILE" ]; then
-    grep -q '^ON_COLOR='  "$CONFIG_FILE" && sed -i "s|^ON_COLOR=.*|ON_COLOR=\"$ON_COLOR\"|"   "$CONFIG_FILE" || echo "ON_COLOR=\"$ON_COLOR\"" >> "$CONFIG_FILE"
-    grep -q '^ARGB_SIZE=' "$CONFIG_FILE" && sed -i "s|^ARGB_SIZE=.*|ARGB_SIZE=\"$ARGB_SIZE\"|" "$CONFIG_FILE" || echo "ARGB_SIZE=\"$ARGB_SIZE\"" >> "$CONFIG_FILE"
-  else
+  if [ ! -f "$CONFIG_FILE" ]; then
     cat > "$CONFIG_FILE" <<EOF
 # pc-leds configuration
-ON_COLOR="$ON_COLOR"     # colour used by 'leds on' (RRGGBB)
-ARGB_SIZE="$ARGB_SIZE"   # LEDs per addressable header (raise for long strips)
-ARGB_ZONES=""            # optional explicit zone indexes, e.g. "0 1 2"
+
+# colour used by 'leds on' (RRGGBB)
+ON_COLOR="$ON_COLOR"
+
+# LEDs per addressable header (raise for long strips)
+ARGB_SIZE="$ARGB_SIZE"
+
+# optional explicit zone indexes, e.g. "0 1 2"; empty = auto-detect
+ARGB_ZONES=""
 EOF
+  else
+    # only override values the user explicitly passed on the command line
+    [ "$ON_COLOR_SET" = 1 ]  && set_kv ON_COLOR "$ON_COLOR"
+    [ "$ARGB_SIZE_SET" = 1 ] && set_kv ARGB_SIZE "$ARGB_SIZE"
+    # repair an ARGB_ZONES line that swallowed a trailing comment
+    grep -Eq '^ARGB_ZONES=.*#' "$CONFIG_FILE" && set_kv ARGB_ZONES ""
+    grep -q '^ON_COLOR='  "$CONFIG_FILE" || set_kv ON_COLOR "$ON_COLOR"
+    grep -q '^ARGB_SIZE=' "$CONFIG_FILE" || set_kv ARGB_SIZE "$ARGB_SIZE"
+    grep -q '^ARGB_ZONES=' "$CONFIG_FILE" || set_kv ARGB_ZONES ""
   fi
   ok "$CONFIG_FILE"
 }

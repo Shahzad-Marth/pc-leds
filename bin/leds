@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  pc-leds - control PC RGB LEDs (motherboard ARGB + RAM) via OpenRGB
+# -----------------------------------------------------------------------------
+#  Usage:  leds {on|off|toggle|status|list}
+#
+#  Config:  ~/.config/pc-leds/config   (auto-created by install.sh)
+# =============================================================================
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pc-leds"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_FILE="$CONFIG_DIR/state"
+mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+
+# ---- defaults (overridden by the config file) -------------------------------
+ON_COLOR="ffffff"     # colour used by 'on'  (RRGGBB)
+ARGB_SIZE="128"       # LEDs per addressable header (raise for long strips)
+ARGB_ZONES=""         # optional explicit zone indexes (e.g. "0 1 2"); empty = auto
+WAIT_MAX="15"         # seconds to wait for devices to appear
+
+# shellcheck source=/dev/null
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+QUIET="${LEDS_QUIET:-0}"
+OPENRGB="${PCLEDS_OPENRGB:-$(command -v openrgb || echo "$HOME/.local/bin/openrgb")}"
+[ -x "$OPENRGB" ] || { echo "pc-leds: OpenRGB not found (install it or set PCLEDS_OPENRGB)" >&2; exit 1; }
+
+run()    { "$OPENRGB" --noautoconnect "$@" >/dev/null 2>&1; }
+notify() { [ "$QUIET" = 1 ] && return 0
+           command -v notify-send >/dev/null 2>&1 && notify-send "PC LEDs" "$1" 2>/dev/null
+           return 0; }
+say()    { [ "$QUIET" = 1 ] && return 0; echo "$@"; }
+
+list_devices() { "$OPENRGB" --noautoconnect -l 2>/dev/null; }
+
+wait_devices() {
+  local i
+  for i in $(seq 1 "$WAIT_MAX"); do
+    list_devices | grep -qE '^[0-9]+: ' && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Emit one line per device: idx \t name \t type \t modes \t zones
+parse_devices() {
+  list_devices | awk '
+    /^[0-9]+: / {
+      if (idx != "") print idx "\t" name "\t" type "\t" modes "\t" zones;
+      idx=$1; sub(/^[0-9]+:[ \t]*/, ""); name=$0; type=""; modes=""; zones=""; next
+    }
+    /^[[:space:]]*Type:/  { sub(/^[[:space:]]*Type:[[:space:]]*/,  ""); type=$0;  next }
+    /^[[:space:]]*Modes:/ { sub(/^[[:space:]]*Modes:[[:space:]]*/, ""); modes=$0; next }
+    /^[[:space:]]*Zones:/ { sub(/^[[:space:]]*Zones:[[:space:]]*/, ""); zones=$0; next }
+    END { if (idx != "") print idx "\t" name "\t" type "\t" modes "\t" zones }
+  '
+}
+
+leds_off() {
+  wait_devices || say "pc-leds: no OpenRGB devices detected"
+  local devs; devs="$(parse_devices)"
+
+  # 1) Size addressable (ARGB) zones on the motherboard so a colour reaches them.
+  local idx name type modes zones
+  while IFS=$'\t' read -r idx name type modes zones; do
+    [ "$type" = "Motherboard" ] || continue
+    local zi=0 zname
+    for zname in $zones; do
+      if printf '%s' "$zname" | grep -qiE 'argb|addr'; then
+        run -d "$idx" -z "$zi" -sz "$ARGB_SIZE" -m Direct -c 000000
+      fi
+      zi=$((zi + 1))
+    done
+    local z
+    for z in ${ARGB_ZONES//,/ }; do
+      [ -n "$z" ] && run -d "$idx" -z "$z" -sz "$ARGB_SIZE" -m Direct -c 000000
+    done
+  done <<< "$devs"
+
+  # 2) Black out every device (also switches anything in an effect to Direct).
+  run -c 000000
+
+  # 3) Use the controller's native "Off" mode where it exists (e.g. ENE DRAM).
+  while IFS=$'\t' read -r idx name type modes zones; do
+    case " $modes " in
+      *" Off "*) run -d "$idx" -m Off ;;
+    esac
+  done <<< "$devs"
+
+  printf 'off\n' > "$STATE_FILE" 2>/dev/null || true
+  notify "OFF"
+  say "LEDs: OFF"
+}
+
+leds_on() {
+  wait_devices || say "pc-leds: no OpenRGB devices detected"
+  run -c "$ON_COLOR"
+  printf 'on\n' > "$STATE_FILE" 2>/dev/null || true
+  notify "ON"
+  say "LEDs: ON ($ON_COLOR)"
+}
+
+case "${1:-toggle}" in
+  off)    leds_off ;;
+  on)     leds_on ;;
+  toggle) [ "$(cat "$STATE_FILE" 2>/dev/null)" = off ] && leds_on || leds_off ;;
+  status|list) list_devices ;;
+  -h|--help|help)
+    cat <<EOF
+pc-leds - control PC RGB LEDs via OpenRGB
+
+  leds on        set every detected device to $ON_COLOR ($CONFIG_FILE)
+  leds off       turn everything off (black / native Off mode)
+  leds toggle    flip between on and off
+  leds status    list the devices OpenRGB can see
+
+Config file: $CONFIG_FILE
+  ON_COLOR=RRGGBB   ARGB_SIZE=N   ARGB_ZONES="0 1 2"
+EOF
+    ;;
+  *) echo "Usage: leds {on|off|toggle|status}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LEDs OFF
+Comment=Turn off all PC RGB LEDs
+Exec=@LEDS@ off
+Terminal=false
+Icon=@ICON@
+Categories=Utility;Settings;

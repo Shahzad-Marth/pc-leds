@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PC LEDs Off (autostart)
+Comment=Turn off all PC RGB LEDs at login
+Exec=env LEDS_QUIET=1 @LEDS@ off
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -137,6 +137,45 @@ leds_on() {
   say "LEDs: ON ($ON_COLOR)"
 }
 
+# --------------------------------------------------------------- rainbow -----
+modes_list() {   # one mode per line (drops quotes and [active] brackets)
+  printf '%s\n' "$1" | grep -oE "'[^']+'|[A-Za-z0-9]+" | tr -d "'"
+}
+
+pick_mode() {    # modes candidate...  -> first candidate that the device offers
+  local modes="$1"; shift
+  local want tok
+  for want in "$@"; do
+    while IFS= read -r tok; do
+      [ "$tok" = "$want" ] && { printf '%s' "$want"; return 0; }
+    done <<< "$(modes_list "$modes")"
+  done
+  return 1
+}
+
+leds_rainbow() {
+  need_openrgb
+  if ! wait_devices; then
+    say "pc-leds: no OpenRGB devices detected"
+    exit 3
+  fi
+  size_argb_zones
+  local devs idx name type modes zones mode
+  devs="$(parse_devices)"
+  # use each device's native animated rainbow/colour-cycle mode (hardware driven)
+  while IFS=$'\t' read -r idx name type modes zones; do
+    mode="$(pick_mode "$modes" Rainbow 'Spectrum Cycle' 'Color Cycle' Spectrum 'Rainbow Wave' || true)"
+    if [ -n "$mode" ]; then
+      run -d "$idx" -m "$mode"
+    elif printf '%s' "$modes" | grep -q 'Direct'; then
+      run -d "$idx" -m Direct -c "$ON_COLOR"   # no rainbow mode: show ON colour
+    fi
+  done <<< "$devs"
+  printf 'on\n' > "$STATE_FILE" 2>/dev/null || true
+  notify "Rainbow"
+  say "LEDs: rainbow"
+}
+
 # ---------------------------------------------------------------- setup ------
 find_installer() {
   local c
@@ -203,6 +242,7 @@ run_gui() {
 case "${1:-toggle}" in
   off)    leds_off ;;
   on)     leds_on ;;
+  rainbow) leds_rainbow ;;
   toggle) [ "$(cat "$STATE_FILE" 2>/dev/null)" = off ] && leds_on || leds_off ;;
   status|list)
     need_openrgb
@@ -216,6 +256,7 @@ pc-leds - control PC RGB LEDs via OpenRGB
 
   leds on        set every detected device to $ON_COLOR
   leds off       turn everything off (black / native Off mode)
+  leds rainbow   animate every device with its native rainbow/colour-cycle
   leds toggle    flip between on and off
   leds status    list the devices OpenRGB can see
   leds setup     install OpenRGB + system configuration (distro-aware)
@@ -225,5 +266,5 @@ Config file: $CONFIG_FILE
   ON_COLOR=RRGGBB   ARGB_SIZE=N   ARGB_ZONES="0 1 2"
 EOF
     ;;
-  *) echo "Usage: leds {on|off|toggle|status|setup|gui}" >&2; exit 1 ;;
+  *) echo "Usage: leds {on|off|toggle|rainbow|status|setup|gui}" >&2; exit 1 ;;
 esac

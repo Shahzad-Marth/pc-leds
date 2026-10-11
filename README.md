@@ -11,6 +11,7 @@ parameters, or zone sizes again.
 ```bash
 leds off      # everything dark
 leds on       # back on (single configurable colour)
+leds rainbow  # animate: native rainbow effect where supported, else colour-cycle
 leds toggle   # flip
 leds status   # what OpenRGB can see
 leds setup    # install OpenRGB + configure this machine (distro-aware)
@@ -18,8 +19,9 @@ leds gui      # open the graphical app
 ```
 
 There's also a GTK4 app (`PC LEDs`), styled dark like OpenRGB, with **ON/OFF**
-buttons, a colour picker, per-device switches, and an **Install / Configure**
-button that installs OpenRGB and sets up the system for you.
+buttons, a **Rainbow** button, a colour picker, per-device switches, and an
+**Install / Configure** button that installs OpenRGB and sets up the system for
+you.
 
 ## Why this exists
 
@@ -76,8 +78,13 @@ Then run `leds status` to confirm your boards/RAM are detected.
 
 Launch **PC LEDs** from your applications/desktop, or run `pc-leds-gui`
 (`leds gui`). It shows every device OpenRGB can see with its supported modes,
-gives you **ON** / **OFF** for everything and a switch per device, and a colour
-picker for the ON colour.
+gives you **ON** / **OFF** for everything and a switch per device, a **Rainbow**
+button, and a colour picker for the ON colour.
+
+**Rainbow** uses each device's own animated effect when it has one that actually
+works (your RAM: `Rainbow`). Hardware without a usable effect — the Gigabyte
+motherboard reports `Color Cycle` but silently ignores it — is animated by the
+app instead (a software hue-cycle) while the window is open.
 
 The **Install / Configure** button runs the same distro-aware setup — it
 installs OpenRGB (native RPM/DEB, else the official AppImage), writes the udev
@@ -121,6 +128,9 @@ the last few LEDs stay lit, raise `ARGB_SIZE`.
   every detected device black, then switches devices that expose a native
   `Off` mode (e.g. ENE DRAM) to it.
 - **`leds on`** — sizes the zones, then paints every device `ON_COLOR`.
+- **`leds rainbow`** — sizes the zones, then sets each device to its native
+  animated `Rainbow`-family effect when it has one; devices without a working
+  effect get the ON colour.
 - Devices are selected by **name/type**, not index, because OpenRGB renumbers
   them between reboots.
 - System changes live in `scripts/setup-system.sh` (run as root), so both the

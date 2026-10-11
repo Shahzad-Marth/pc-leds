@@ -9,6 +9,7 @@
 #
 #  Runs on the system Python (needs python3-gobject, gtk4, libadwaita).
 # =============================================================================
+import colorsys
 import os
 import re
 import shlex
@@ -33,6 +34,7 @@ SUPPORT_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".
 
 DEFAULT_ON = "ffffff"
 DEFAULT_ARGB = "128"
+RAINBOW_MODES = ["Rainbow", "Spectrum Cycle", "Color Cycle", "Spectrum", "Rainbow Wave"]
 
 
 # --------------------------------------------------------------- helpers -----
@@ -164,6 +166,20 @@ def friendly_type(kind):
     return {"DRAM": "RAM"}.get(kind, kind)
 
 
+def pick_mode(modes, candidates=RAINBOW_MODES):
+    """First candidate the device lists (mode names may carry [] or quotes)."""
+    names = {m.strip("[]'") for m in modes}
+    for cand in candidates:
+        if cand in names:
+            return cand
+    return None
+
+
+def hsv_to_hex(hue, sat=1.0, val=1.0):
+    r, g, b = colorsys.hsv_to_rgb((hue % 360.0) / 360.0, sat, val)
+    return "%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
 def group_devices(devices):
     """Collapse devices that share a type into one row (e.g. all RAM sticks)."""
     by_type, order = {}, []
@@ -216,6 +232,8 @@ class Window(Adw.ApplicationWindow):
         # index -> last state we set (a bare Direct-black device still reads
         # "Direct" from OpenRGB, so we can't infer on/off from the mode alone)
         self.dev_state = {}
+        self._rainbow_stop = None
+        self.connect("close-request", lambda *_: (self.stop_rainbow(), False)[1])
 
         self.toast = Adw.ToastOverlay()
         toolbar = Adw.ToolbarView()
@@ -255,8 +273,12 @@ class Window(Adw.ApplicationWindow):
         off_btn = Gtk.Button(label="OFF")
         off_btn.add_css_class("destructive-action")
         off_btn.connect("clicked", lambda *_: self.do_all(False))
+        rainbow_btn = Gtk.Button(label="Rainbow")
+        rainbow_btn.set_tooltip_text("Animate every device with its native rainbow/colour-cycle")
+        rainbow_btn.connect("clicked", lambda *_: self.do_rainbow())
         box.append(on_btn)
         box.append(off_btn)
+        box.append(rainbow_btn)
         big_row.add_suffix(box)
         g_all.add(big_row)
 
@@ -296,6 +318,7 @@ class Window(Adw.ApplicationWindow):
         self.on_color_hex = rgba_to_hex(btn.get_rgba())
 
     def _on_group_switch(self, _sw, state, group):
+        self.stop_rainbow()
         for dev in group["devices"]:
             self.dev_state[dev["index"]] = state
         # if that leaves every device the same, keep the CLI state file in sync
@@ -314,12 +337,20 @@ class Window(Adw.ApplicationWindow):
 
     # ------------------------------------------------------------ actions ----
     def do_all(self, on):
+        self.stop_rainbow()
         self.cfg["ON_COLOR"] = self.on_color_hex
         write_config(self.cfg)
         self.leds_state = "on" if on else "off"
         for dev in self.devices:          # every device follows the All button
             self.dev_state[dev["index"]] = on
         self.apply_async(lambda: self.apply_all(on), "All LEDs: %s" % ("ON" if on else "OFF"))
+
+    def do_rainbow(self):
+        self.stop_rainbow()
+        self.leds_state = "on"
+        for dev in self.devices:
+            self.dev_state[dev["index"]] = True
+        self.apply_async(lambda: self.apply_rainbow(), "All LEDs: Rainbow")
 
     def apply_all(self, on):
         if self.leds:
@@ -330,6 +361,47 @@ class Window(Adw.ApplicationWindow):
         # A bare -c will not leave an effect/Off mode; Direct is required.
         subprocess.run([self.openrgb, "--noautoconnect", "-m", "Direct", "-c",
                         self.on_color_hex if on else "000000"], capture_output=True, text=True)
+
+    def apply_rainbow(self):
+        if not self.openrgb:
+            raise RuntimeError("OpenRGB not installed")
+        software = []
+        for dev in self.devices:
+            mode = pick_mode(dev["modes"])
+            applied = False
+            if mode:                       # try the hardware effect first
+                subprocess.run([self.openrgb, "--noautoconnect",
+                                "-d", str(dev["index"]), "-m", mode],
+                               capture_output=True, text=True)
+                # some controllers list an effect but ignore it (the board stays
+                # Direct), so confirm the active mode actually changed
+                now = [d for d in list_devices(self.openrgb) if d["index"] == dev["index"]]
+                applied = bool(now) and active_mode(now[0]["modes"]) == mode
+            if not applied:                # no working effect: animate it ourselves
+                software.append(dev)
+        self.stop_rainbow()
+        if software:
+            ev = threading.Event()
+            self._rainbow_stop = ev
+            threading.Thread(target=self._rainbow_loop,
+                             args=(software, ev), daemon=True).start()
+
+    def _rainbow_loop(self, devices, stop):
+        hue = 0.0
+        while not stop.is_set():
+            colour = hsv_to_hex(hue)
+            for dev in devices:
+                subprocess.run([self.openrgb, "--noautoconnect", "-d",
+                                str(dev["index"]), "-m", "Direct", "-c", colour],
+                               capture_output=True, text=True)
+            hue = (hue + 6.0) % 360.0
+            stop.wait(0.12)
+
+    def stop_rainbow(self):
+        ev = getattr(self, "_rainbow_stop", None)
+        if ev is not None:
+            ev.set()
+            self._rainbow_stop = None
 
     def apply_device(self, dev, on):
         if not self.openrgb:

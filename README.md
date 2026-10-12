@@ -151,9 +151,10 @@ and provides:
 **Rainbow** uses each device's own animated effect when it has one that
 actually works (RAM: `Rainbow`). Hardware without a usable effect — some boards
 report `Color Cycle` but silently ignore it — is animated by the app itself: it
-starts a temporary OpenRGB SDK server and streams a moving rainbow gradient to
-the device at ~25 fps while the window is open (one-shot `openrgb` calls are
-far too slow for this).
+keeps an OpenRGB SDK server for the session and streams a moving rainbow
+gradient to the device at ~25 fps (one-shot `openrgb` calls are far too slow
+for this). The first click takes a few seconds while the server detects the
+hardware; later clicks are instant.
 
 ## Configuration
 
@@ -202,9 +203,10 @@ Both simply run `leds off` quietly after login.
 - **Device selection** — devices are addressed by their index in OpenRGB's
   device list, which is refreshed automatically at the start of each boot.
 - **GUI software rainbow** — controllers that list effects but ignore them (the
-  Gigabyte board) are animated by the app: it starts a temporary OpenRGB SDK
-  server and streams a moving rainbow gradient at ~25 fps, then stops the
-  server when the animation ends. RAM uses its own hardware `Rainbow` effect.
+  Gigabyte board) are animated by the app: it starts an OpenRGB SDK server and
+  streams a moving rainbow gradient at ~25 fps, keeping the server for the
+  session (so repeat clicks are instant) and stopping it on exit. RAM uses its
+  own hardware `Rainbow` effect.
 - **Shared system setup** — all root-level work lives in
   `scripts/setup-system.sh`, so the installer (via `sudo`) and the GUI (via
   `pkexec`) reuse exactly the same logic.

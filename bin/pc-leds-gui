@@ -320,8 +320,10 @@ class Window(Adw.ApplicationWindow):
         self._rainbow_stop = None
         self._sdk = None               # OpenRgbSdk while a software rainbow runs
         self._server_proc = None       # OpenRGB server we started (if any)
+        self._rainbow_plan = None      # idx -> ("native", mode) | ("software", None)
+        self._native_applied = False   # have the native effects been set already?
         self._color_timer = 0
-        self.connect("close-request", lambda *_: (self.stop_rainbow(), False)[1])
+        self.connect("close-request", lambda *_: (self.shutdown(), False)[1])
 
         self.toast = Adw.ToastOverlay()
         toolbar = Adw.ToolbarView()
@@ -416,6 +418,7 @@ class Window(Adw.ApplicationWindow):
 
     def _apply_color_now(self):
         self._color_timer = 0
+        self._native_applied = False
         for dev in self.devices:
             self.dev_state[dev["index"]] = True
         self.sync_switches()
@@ -425,6 +428,7 @@ class Window(Adw.ApplicationWindow):
 
     def _on_group_switch(self, _sw, state, group):
         self.stop_rainbow()
+        self._native_applied = False
         for dev in group["devices"]:
             self.dev_state[dev["index"]] = state
         # if that leaves every device the same, keep the CLI state file in sync
@@ -463,6 +467,7 @@ class Window(Adw.ApplicationWindow):
     # ------------------------------------------------------------ actions ----
     def do_all(self, on):
         self.stop_rainbow()
+        self._native_applied = False
         self.cfg["ON_COLOR"] = self.on_color_hex
         write_config(self.cfg)
         self.leds_state = "on" if on else "off"
@@ -493,23 +498,64 @@ class Window(Adw.ApplicationWindow):
     def apply_rainbow(self):
         if not self.openrgb:
             raise RuntimeError("OpenRGB not installed")
-        software = []
+        # Bring the SDK server up first and let it detect hardware while we make
+        # the native-effect CLI call, so the two overlap instead of stacking.
+        warm = {}
+        warmsrv = threading.Thread(
+            target=lambda: warm.setdefault("proc", self._ensure_server()), daemon=True)
+        warmsrv.start()
+        if self._rainbow_plan is None:
+            # first time: classify devices once (set effect + verify) and cache
+            self._rainbow_plan = self._compute_rainbow_plan()
+            self._native_applied = True
+        elif not self._native_applied:
+            self._apply_native_modes()
+            self._native_applied = True
+        plan = self._rainbow_plan
+        self.stop_rainbow()
+        software = [d for d in self.devices
+                    if plan.get(d["index"], ("software", None))[0] == "software"]
+        if software:
+            warmsrv.join(timeout=16)       # don't race the server bring-up
+            self._start_software_rainbow(software)
+
+    # -- rainbow classification / native effects --------------------------
+    def _set_native_modes(self, pairs):
+        """Set several devices' effects in ONE openrgb call.  True if it ran."""
+        args = [self.openrgb, "--noautoconnect"]
+        for idx, mode in pairs:
+            args += ["-d", str(idx), "-m", mode]
+        if len(args) <= 2:
+            return False
+        subprocess.run(args, capture_output=True, text=True)
+        return True
+
+    def _compute_rainbow_plan(self):
+        """Once per device list: work out which devices need software animation."""
+        plan = {}
+        would = []
         for dev in self.devices:
             mode = pick_mode(dev["modes"])
-            applied = False
-            if mode:                       # try the hardware effect first
-                subprocess.run([self.openrgb, "--noautoconnect",
-                                "-d", str(dev["index"]), "-m", mode],
-                               capture_output=True, text=True)
-                # some controllers list an effect but ignore it (the board stays
-                # Direct), so confirm the active mode actually changed
-                now = [d for d in list_devices(self.openrgb) if d["index"] == dev["index"]]
-                applied = bool(now) and active_mode(now[0]["modes"]) == mode
-            if not applied:                # no working effect: animate it ourselves
-                software.append(dev)
-        self.stop_rainbow()
-        if software:
-            self._start_software_rainbow(software)
+            if mode:
+                plan[dev["index"]] = ("native", mode)
+                would.append((dev["index"], mode))
+            else:
+                plan[dev["index"]] = ("software", None)
+        if would:
+            self._set_native_modes(would)
+            # some controllers list an effect but silently ignore it (the board
+            # stays Direct), so confirm the active mode actually changed
+            now = {d["index"]: active_mode(d["modes"]) for d in list_devices(self.openrgb)}
+            for idx, mode in would:
+                if now.get(idx) != mode:
+                    plan[idx] = ("software", None)
+        return plan
+
+    def _apply_native_modes(self):
+        plan = self._rainbow_plan or {}
+        pairs = [(idx, mode) for idx, (kind, mode) in plan.items()
+                 if kind == "native" and mode]
+        self._set_native_modes(pairs)
 
     # -- software rainbow -------------------------------------------------
     # The board lists effects but silently ignores them, so we animate it by
@@ -521,12 +567,8 @@ class Window(Adw.ApplicationWindow):
         if not targets:
             self._start_cli_rainbow(devices)
             return
-        proc = self.ensure_server()
-        try:
-            sdk = OpenRgbSdk()
-        except OSError:
-            if proc is not None:
-                proc.terminate()
+        sdk = self._get_sdk()
+        if sdk is None:
             self._start_cli_rainbow(devices)
             return
         for idx, _n in targets:            # make sure each device is in Direct
@@ -536,8 +578,6 @@ class Window(Adw.ApplicationWindow):
                 pass
         ev = threading.Event()
         self._rainbow_stop = ev
-        self._sdk = sdk
-        self._server_proc = proc
         threading.Thread(target=self._sdk_rainbow_loop,
                          args=(sdk, targets, ev), daemon=True).start()
 
@@ -575,12 +615,14 @@ class Window(Adw.ApplicationWindow):
             hue = (hue + 12.0) % 360.0
             stop.wait(0.12)
 
-    def ensure_server(self):
-        """Return a running OpenRGB server process we started, or None.
-
-        None also means "a server was already up" (e.g. the OpenRGB GUI), so
-        callers must not kill it.
-        """
+    # -- SDK server lifecycle ---------------------------------------------
+    # The server is started once and kept alive for the whole GUI session (so
+    # repeat Rainbow clicks are instant) and torn down on quit.  A server that
+    # was already running (e.g. the OpenRGB GUI) is reused but never killed.
+    def _ensure_server(self):
+        if self._server_proc is not None and self._server_proc.poll() is None:
+            return self._server_proc
+        self._server_proc = None
         if server_running():
             return None
         if not self.openrgb:
@@ -592,20 +634,36 @@ class Window(Adw.ApplicationWindow):
                 start_new_session=True)
         except OSError:
             return None
-        for _ in range(60):                # up to ~12 s for hardware detection
+        self._server_proc = proc
+        for _ in range(75):                # up to ~15 s for hardware detection
+            if proc.poll() is not None:
+                self._server_proc = None
+                return None
             if server_running():
                 return proc
-            if proc.poll() is not None:
-                return None
             time.sleep(0.2)
-        proc.terminate()
-        return None
+        return proc
+
+    def _get_sdk(self):
+        if self._sdk is not None:
+            return self._sdk
+        self._ensure_server()
+        try:
+            self._sdk = OpenRgbSdk()
+        except OSError:
+            return None
+        return self._sdk
 
     def stop_rainbow(self):
+        """Stop any running animation; keep the server/SDK for a fast restart."""
         ev = getattr(self, "_rainbow_stop", None)
         if ev is not None:
             ev.set()
             self._rainbow_stop = None
+
+    def shutdown(self):
+        """Stop the animation and tear down the SDK server we started."""
+        self.stop_rainbow()
         sdk = getattr(self, "_sdk", None)
         if sdk is not None:
             self._sdk = None
@@ -642,6 +700,7 @@ class Window(Adw.ApplicationWindow):
     def apply_device(self, dev, on):
         if not self.openrgb:
             raise RuntimeError("OpenRGB not installed")
+        self._native_applied = False
         args = [self.openrgb, "--noautoconnect", "-d", str(dev["index"])]
         if on:
             if any(m.strip("[]") == "Direct" for m in dev["modes"]):
@@ -704,6 +763,7 @@ class Window(Adw.ApplicationWindow):
         self.dev_rows = []
         self.switch_rows = []
         self.devices = list_devices(self.openrgb)
+        self._rainbow_plan = None       # device list changed -> reclassify
 
         if not self.openrgb:
             placeholder = Adw.ActionRow(title="OpenRGB not installed",
